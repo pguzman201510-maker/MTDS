@@ -1045,16 +1045,29 @@ class MTDSOptimizer:
     Restricciones alineadas con lineamientos MHCP / BM-FMI Colombia.
     """
 
-    BOUNDS = [
-        (0.05, 0.55),   # DI COP Fija
-        (0.05, 0.35),   # DI UVR Fija
-        (0.01, 0.35),   # DE USD Fija
-        (0.01, 0.20),   # DE EUR Fija
-        (0.00, 0.12),   # DE EUR Variable
-        (0.00, 0.12),   # DE USD Variable
-        (0.00, 0.10),   # DE CHF Fija
-        (0.00, 0.06),   # DE CHF Variable
-    ]
+    def __init__(self, calc: CostRiskCalc, lam: float = 1.5, ref_w: np.ndarray = None):
+        self.calc = calc
+        self.lam  = lam
+
+        # Original default bounds
+        self.bounds = [
+            (0.05, 0.55),   # DI COP Fija
+            (0.05, 0.35),   # DI UVR Fija
+            (0.01, 0.35),   # DE USD Fija
+            (0.01, 0.20),   # DE EUR Fija
+            (0.00, 0.12),   # DE EUR Variable
+            (0.00, 0.12),   # DE USD Variable
+            (0.00, 0.10),   # DE CHF Fija
+            (0.00, 0.06),   # DE CHF Variable
+        ]
+
+        # Ajuste de cotas: si el instrumento ya tiene participación (ref_w > 0),
+        # asegurar que la cota inferior sea por lo menos 1% (0.01)
+        if ref_w is not None:
+            for i in range(N_INST):
+                if ref_w[i] > 0.001:
+                    low, high = self.bounds[i]
+                    self.bounds[i] = (max(low, 0.01), high)
 
     @staticmethod
     def _constraints():
@@ -1090,10 +1103,6 @@ class MTDSOptimizer:
             {"type": "ineq", "fun": lambda w: 0.16 - (w[6]+w[7])},   # CHF ≤ 16 %
         ]
 
-    def __init__(self, calc: CostRiskCalc, lam: float = 1.5):
-        self.calc = calc
-        self.lam  = lam
-
     def _obj(self, w):
         m = self.calc.metrics(w)
         return m["cost_ev"] + self.lam * m["cost_std"]
@@ -1104,7 +1113,7 @@ class MTDSOptimizer:
             w0 = np.random.dirichlet(np.ones(N_INST))
             try:
                 res = minimize(self._obj, w0, method="SLSQP",
-                               bounds=self.BOUNDS,
+                               bounds=self.bounds,
                                constraints=self._constraints(),
                                options={"maxiter": 2000, "ftol": 1e-12})
                 if res.success and res.fun < best_val:
@@ -1430,7 +1439,7 @@ def build_bloomberg_template(path: str):
 # 10. GUARDAR RESULTADOS  (Excel BM-FMI completo)
 # ══════════════════════════════════════════════════════════════════════════════
 def save_results(w: np.ndarray, mc_metrics: dict, stress: dict,
-                 port: dict, frontier: pd.DataFrame, path: str):
+                 port: dict, frontier: pd.DataFrame, path: str, df_scenarios: pd.DataFrame = None, p_dict: dict = None):
 
     wb = Workbook()
     NAVY, BLUE, LBLUE = "1F3864", "2E74B5", "D6E4F0"
@@ -1555,15 +1564,19 @@ def save_results(w: np.ndarray, mc_metrics: dict, stress: dict,
            "Tasas +200 pbs + Depr. 30%"),
           ("Δ vs. base (pp de PIB)",        f"+{stress['combinado']['delta_pct_gdp']:.3f}%",
            "Capacidad de absorción de shocks"),]),
-        ("ANÁLISIS ESTOCÁSTICO (1,000 escenarios Monte Carlo)",
-         [("E[int/PIB] — esperanza matemática", f"{mc_metrics['cost_ev']:.3f}%",
+        ("ANÁLISIS ESTOCÁSTICO Y SELECCIÓN DE CANASTA",
+         [("Función Objetivo Optimizador", "E[Costo] + λ × σ[Costo]",
+           "Criterio de selección de la combinación óptima"),
+          ("Aversión al Riesgo (λ)", f"{p_dict.get('risk_aversion', 1.5) if p_dict else 1.5}",
+           "Parámetro de aversión en la optimización"),
+          ("E[int/PIB] — Costo Esperado", f"{mc_metrics['cost_ev']:.3f}%",
            "Promedio sobre 1,000 trayectorias"),
-          ("σ[int/PIB] — desviación estándar",  f"{mc_metrics['cost_std']:.3f}%",
+          ("σ[int/PIB] — Riesgo (Std Dev)",  f"{mc_metrics['cost_std']:.3f}%",
            "Dispersión del costo"),
+          ("Valor Función Objetivo", f"{(mc_metrics['cost_ev'] + (p_dict.get('risk_aversion', 1.5) if p_dict else 1.5) * mc_metrics['cost_std']):.3f}%",
+           "Métrica de riesgo total minimizada"),
           ("CVaR 95% (% PIB)",                  f"{mc_metrics['cvar95']:.3f}%",
-           "Expected shortfall escenarios adversos"),
-          ("Percentil 5% — escenario favorable",f"{mc_metrics['p5']:.3f}%", ""),
-          ("Percentil 95% — escenario adverso", f"{mc_metrics['p95']:.3f}%", ""),]),
+           "Expected shortfall escenarios adversos"),]),
     ]
 
     r2 = 3
@@ -1614,6 +1627,19 @@ def save_results(w: np.ndarray, mc_metrics: dict, stress: dict,
         dc(ws4, r_i, 2, round(float(val), 5), bg=bg_r, align="center")
     ws4.column_dimensions["A"].width = 14
     ws4.column_dimensions["B"].width = 26
+
+    # ── Hoja 5: 1,000 Escenarios Completos ────────────────────────────────
+    if df_scenarios is not None:
+        ws5 = wb.create_sheet("Escenarios_1000")
+        ws5.sheet_view.showGridLines = False
+        title_row(ws5, 1, "1,000 ESCENARIOS MONTE CARLO Y MÉTRICAS CALCULADAS", cols=len(df_scenarios.columns))
+        for j, col_name in enumerate(df_scenarios.columns, 1):
+            hc(ws5, 2, j, col_name, bg=BLUE, sz=9)
+            ws5.column_dimensions[get_column_letter(j)].width = 16
+        for r_i, row_data in enumerate(df_scenarios.itertuples(index=False), 3):
+            bg_r = GRAY if r_i % 2 == 0 else "FFFFFF"
+            for j, val in enumerate(row_data, 1):
+                dc(ws5, r_i, j, val, bg=bg_r, align="center")
 
     wb.save(path)
 
@@ -1826,7 +1852,7 @@ def main():
     # ── [4] Optimización ───────────────────────────────────────────────────
     print(f"\n[4/6]  Optimizando MTDS (COP+UVR≥60%, λ={lam}, 30 arranques) …")
     calc = CostRiskCalc(scen, p)
-    opt  = MTDSOptimizer(calc, lam=lam)
+    opt  = MTDSOptimizer(calc, lam=lam, ref_w=ref_w)
     res  = opt.optimize(n_starts=30)
     w_opt, mc = res["weights"], res["metrics"]
 
@@ -1877,7 +1903,10 @@ def main():
     # ── [5] Guardar resultados ─────────────────────────────────────────────
     print("\n[5/6]  Guardando resultados MTDS 2026 …")
     res_path = r"MTDS_2026_Resultados.xlsx"
-    save_results(w_opt, mc, stress, port, frontier, res_path)
+    # Añadimos de vuelta risk_aversion al dict p para reportes si fue borrado con .pop()
+    p["risk_aversion"] = lam
+    df_scenarios_1000 = calc.scenario_dataframe(w_opt, n_scenarios=1000)
+    save_results(w_opt, mc, stress, port, frontier, res_path, df_scenarios=df_scenarios_1000, p_dict=p)
     print(f"       ✔  {res_path}")
 
     print("\n[6/6]  Copiando script a outputs …")
@@ -1956,10 +1985,17 @@ def main():
     metrics_report.append(f"  Δ int/PIB shock +200pbs:     +{stress['tasa+200']['delta_pct_gdp']:.3f}%")
     metrics_report.append(f"  Δ int/PIB depr. 30% COP:     +{stress['depr30']['delta_pct_gdp']:.3f}%")
     metrics_report.append(f"  Δ int/PIB shock combinado:   +{stress['combinado']['delta_pct_gdp']:.3f}%")
-    metrics_report.append(f"\n  ── ANÁLISIS ESTOCÁSTICO ({n_scenarios:,} escenarios MC) ────────────")
-    metrics_report.append(f"  E[int/PIB]:                  {mc['cost_ev']:.3f}%")
-    metrics_report.append(f"  σ[int/PIB]:                  {mc['cost_std']:.3f}%")
-    metrics_report.append(f"  CVaR 95%:                    {mc['cvar95']:.3f}%")
+
+    metrics_report.append(f"\n  ── CRITERIOS DE SELECCIÓN (Métricas de Riesgo) ───────────────────")
+    metrics_report.append(f"  La combinación óptima fue seleccionada minimizando la")
+    metrics_report.append(f"  siguiente función objetivo basada en los {n_scenarios:,} escenarios MC:")
+    metrics_report.append(f"     Objetivo = E[Costo] + λ × σ[Costo]")
+    metrics_report.append(f"  Donde:")
+    metrics_report.append(f"  - λ (Aversión al riesgo):    {lam}")
+    metrics_report.append(f"  - E[Costo] (Esperado):       {mc['cost_ev']:.3f}% PIB")
+    metrics_report.append(f"  - σ[Costo] (Desv. Estándar): {mc['cost_std']:.3f}% PIB")
+    metrics_report.append(f"  - Valor Objetivo minimizado: {(mc['cost_ev'] + lam * mc['cost_std']):.3f}%")
+    metrics_report.append(f"  - CVaR 95%:                  {mc['cvar95']:.3f}%")
     metrics_report.append("=" * 70)
     pdf.add_terminal_text("\n".join(metrics_report))
 
