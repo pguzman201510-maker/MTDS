@@ -44,6 +44,10 @@ from openpyxl.utils import get_column_letter
 import warnings, shutil, os
 from fpdf import FPDF
 from datetime import datetime
+import yfinance as yf
+from statsmodels.tsa.arima.model import ARIMA
+from sklearn.metrics import root_mean_squared_error, mean_absolute_error
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
@@ -1675,6 +1679,94 @@ class MTDSPDF(FPDF):
         self.multi_cell(0, 5, clean_text)
         self.ln(5)
 # ══════════════════════════════════════════════════════════════════════════════
+# 10.5 FORECASTING (YAHOO FINANCE + ARIMA)
+# ══════════════════════════════════════════════════════════════════════════════
+def apply_forecasts(p: dict) -> dict:
+    """
+    Descarga histórico 5Y de USD/COP, EUR/USD, CHF/USD, y US Treasury 10Y.
+    Construye modelos ARIMA para proyectar drift esperado.
+    """
+    print("\n[  *  ] Conectando a Yahoo Finance para extraer histórico 5Y...")
+    tickers = ['COP=X', 'EURUSD=X', 'CHFUSD=X', '^TNX']
+    data = yf.download(tickers, period="5y", progress=False)["Close"]
+
+    # Calcular cruces directos contra COP
+    data["USDCOP"] = data["COP=X"]
+    data["EURCOP"] = data["EURUSD=X"] * data["USDCOP"]
+    data["CHFCOP"] = data["CHFUSD=X"] * data["USDCOP"]
+    data["UST10Y"] = data["^TNX"]
+
+    df = data[["USDCOP", "EURCOP", "CHFCOP", "UST10Y"]].dropna()
+
+    forecasts = {}
+    metrics = []
+
+    print("        Ajustando modelos ARIMA y calculando errores...")
+    plt.figure(figsize=(15, 10))
+    for i, col in enumerate(["USDCOP", "EURCOP", "CHFCOP", "UST10Y"]):
+        ts = df[col].values
+
+        # Modelo base ARIMA(1,1,0) para divisas, ARIMA(1,0,0) para tasas
+        order = (1,1,0) if col != "UST10Y" else (1,0,0)
+        try:
+            model = ARIMA(ts, order=order).fit()
+            # Proyección a 5 años = ~1260 días de trading
+            fcast = model.get_forecast(steps=1260)
+            f_mean = fcast.predicted_mean
+
+            # Ajuste in-sample para medir errores
+            in_sample = model.predict(start=1, end=len(ts)-1)
+            rmse = root_mean_squared_error(ts[1:], in_sample)
+            mae = mean_absolute_error(ts[1:], in_sample)
+
+            metrics.append({"Variable": col, "RMSE": rmse, "MAE": mae})
+
+            # Graficar
+            plt.subplot(2, 2, i+1)
+            plt.plot(ts, label="Histórico", color="navy")
+            plt.plot(range(len(ts), len(ts)+1260), f_mean, label="Proyección", color="red", linestyle="--")
+            plt.title(f"{col} - RMSE: {rmse:.4f}")
+            plt.legend()
+
+            if col == "USDCOP":
+                # Calcular drift promedio esperado
+                # Drift = log(E_T / E_0) / T
+                drift_pct = (np.log(f_mean[-1] / ts[-1]) / 5.0) * 100
+                p["usdcop_drift"] = drift_pct
+                p["usdcop_spot"] = ts[-1]
+            elif col == "EURCOP":
+                drift_pct = (np.log(f_mean[-1] / ts[-1]) / 5.0) * 100
+                p["eurcop_drift"] = drift_pct
+                p["eurcop_spot"] = ts[-1]
+            elif col == "CHFCOP":
+                drift_pct = (np.log(f_mean[-1] / ts[-1]) / 5.0) * 100
+                p["chfcop_drift"] = drift_pct
+                p["chfcop_spot"] = ts[-1]
+            elif col == "UST10Y":
+                # Usamos la tasa proyectada al final como la base USD fija
+                p["usd_fixed_rate"] = f_mean[-1]
+        except Exception as e:
+            print(f"        Error ajustando {col}: {e}")
+
+    plt.tight_layout()
+    plot_path = "Forecasts_YahooFinance.png"
+    plt.savefig(plot_path)
+    plt.close()
+
+    # Crear log para PDF
+    log = "\n── PRONÓSTICOS Y MEDICIÓN DE ERRORES (YAHOO FINANCE) ──\n"
+    for m in metrics:
+        log += f"  {m['Variable']:<10} RMSE: {m['RMSE']:>10.4f}   MAE: {m['MAE']:>10.4f}\n"
+    log += f"  Drift proyectado USDCOP: {p['usdcop_drift']:.2f}%\n"
+    log += f"  Drift proyectado EURCOP: {p['eurcop_drift']:.2f}%\n"
+    log += f"  Drift proyectado CHFCOP: {p['chfcop_drift']:.2f}%\n"
+    log += f"  Tasa USD Fija base proy: {p['usd_fixed_rate']:.2f}%\n"
+    log += f"  Gráfico guardado en: {plot_path}\n"
+
+    return {"p": p, "log": log, "plot": plot_path}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 11. MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
@@ -1704,9 +1796,14 @@ def main():
     for msg in tpl["log"]:
         print(f"        {msg}")
 
-    # ── Construir parámetros fusionando las tres fuentes ──────────────────
+    # ── [0d] YAHOO FINANCE FORECASTS ───────────────────────────────────────
     # Prioridad: Oracle (datos reales) > Bloomberg template > PARAMS default
     p = tpl["params"]
+
+    forecast_results = apply_forecasts(p)
+    p = forecast_results["p"]
+    print(forecast_results["log"])
+
     n_scenarios = int(p.pop("n_scenarios", 1000))
     horizon     = int(p.pop("horizon", 5))
     lam         = float(p.pop("risk_aversion", 1.5))
@@ -1849,10 +1946,67 @@ def main():
     conn.close()
     print("       ✔  Base de datos guardada: MTDS_Escenarios.db")
 
-    # ── [4] Optimización ───────────────────────────────────────────────────
-    print(f"\n[4/6]  Optimizando MTDS (COP+UVR≥60%, λ={lam}, 30 arranques) …")
+    # ── [4] Estrategias Aleatorias y Alternativas ──────────────────────────
+    print(f"\n[4/6]  Evaluando 1,000 Estrategias y Alternativas Int/Ext …")
     calc = CostRiskCalc(scen, p)
+
+    # 1. 1,000 Estrategias Aleatorias
+    rand_strats = []
+    for i in range(1000):
+        w_rand = np.random.dirichlet(np.ones(N_INST))
+        m_rand = calc.metrics(w_rand)
+        rand_strats.append({
+            "Estrategia_ID": i + 1,
+            "Costo_Esp": m_rand["cost_ev"],
+            "Riesgo_Std": m_rand["cost_std"],
+            "CVaR_95": m_rand["cvar95"],
+            "w_DI_COP_F": w_rand[0], "w_DI_UVR_F": w_rand[1],
+            "w_DE_USD_F": w_rand[2], "w_DE_EUR_F": w_rand[3],
+            "w_DE_EUR_V": w_rand[4], "w_DE_USD_V": w_rand[5],
+            "w_DE_CHF_F": w_rand[6], "w_DE_CHF_V": w_rand[7]
+        })
+    df_1000_strats = pd.DataFrame(rand_strats)
+
+    # 2. Alternativas Int/Ext (50/50, 60/40, 70/30, 80/20)
+    alts = []
     opt  = MTDSOptimizer(calc, lam=lam, ref_w=ref_w)
+
+    # Original boundaries saved
+    orig_constraints = opt._constraints
+
+    alt_targets = [0.50, 0.60, 0.70, 0.80]
+    for target_int in alt_targets:
+        # Override constraints dynamically for this target
+        def custom_constraints():
+            return [
+                {"type": "eq",   "fun": lambda w: w.sum() - 1.0},
+                {"type": "eq",   "fun": lambda w: (w[0]+w[1]) - target_int}, # EXACT target int
+                {"type": "eq",   "fun": lambda w: (w[2]+w[3]+w[4]+w[5]+w[6]+w[7]) - (1.0 - target_int)},
+                {"type": "ineq", "fun": lambda w: w[0] - 0.10},
+                {"type": "ineq", "fun": lambda w: 0.35 - w[1]},
+                {"type": "ineq", "fun": lambda w: (w[0]+w[1]+w[2]+w[3]+w[6]) - 0.55},
+                {"type": "ineq", "fun": lambda w: 0.30 - (w[2]+w[5])},
+                {"type": "ineq", "fun": lambda w: 0.15 - (w[3]+w[4])},
+                {"type": "ineq", "fun": lambda w: 0.16 - (w[6]+w[7])},
+            ]
+        opt._constraints = custom_constraints
+        try:
+            r = opt.optimize(n_starts=10)
+            m = r["metrics"]
+            alts.append({
+                "Alternativa": f"{int(target_int*100)}/{int((1-target_int)*100)}",
+                "Costo_Esp": m["cost_ev"],
+                "Riesgo_Std": m["cost_std"],
+                "CVaR_95": m["cvar95"],
+                **{INSTRUMENTS[i][0]: r["weights"][i] for i in range(N_INST)}
+            })
+        except Exception:
+            pass
+
+    df_alts = pd.DataFrame(alts)
+
+    # Restore constraints for main optimization
+    opt._constraints = orig_constraints
     res  = opt.optimize(n_starts=30)
     w_opt, mc = res["weights"], res["metrics"]
 
@@ -1906,8 +2060,27 @@ def main():
     # Añadimos de vuelta risk_aversion al dict p para reportes si fue borrado con .pop()
     p["risk_aversion"] = lam
     df_scenarios_1000 = calc.scenario_dataframe(w_opt, n_scenarios=1000)
+
+    # We will temporarily append the new sheets logic directly to the workbook inside save_results context
+    # but since save_results saves and closes, we do it after.
     save_results(w_opt, mc, stress, port, frontier, res_path, df_scenarios=df_scenarios_1000, p_dict=p)
-    print(f"       ✔  {res_path}")
+
+    # Append the new sheets 1000_Estrategias and Alternativas_Int_Ext
+    from openpyxl.utils.dataframe import dataframe_to_rows
+    wb = load_workbook(res_path)
+
+    ws_strats = wb.create_sheet("1000_Estrategias")
+    for r in dataframe_to_rows(df_1000_strats, index=False, header=True):
+        ws_strats.append(r)
+
+    ws_alts = wb.create_sheet("Alternativas_Int_Ext")
+    for r in dataframe_to_rows(df_alts, index=False, header=True):
+        ws_alts.append(r)
+
+    wb.save(res_path)
+    wb.close()
+
+    print(f"       ✔  {res_path} (Incluyendo 1000 Estrategias y Alternativas Int/Ext)")
 
     print("\n[6/6]  Copiando script a outputs …")
     shutil.copy(__file__, r"mtds_2026_v2_ejecutado.py")
@@ -1999,6 +2172,18 @@ def main():
     metrics_report.append("=" * 70)
     pdf.add_terminal_text("\n".join(metrics_report))
     
+    # ADD YAHOO FORECAST AND ALTERNATIVES TO PDF
+    pdf.add_page()
+    pdf.chapter_title("4. PRONÓSTICOS MACRO (YAHOO FINANCE)")
+    pdf.add_terminal_text(forecast_results["log"])
+    pdf.image(forecast_results["plot"], w=180)
+
+    pdf.add_page()
+    pdf.chapter_title("5. ALTERNATIVAS DE COMPOSICIÓN (INT/EXT)")
+    alt_text = "Evaluación de diferentes límites de Deuda Interna / Externa:\n\n"
+    alt_text += df_alts.to_string(index=False)
+    pdf.add_terminal_text(alt_text)
+
     pdf_path = r"MTDS_2026_Reporte_Ejecutivo.pdf"
     pdf.output(pdf_path)
     print(f"       ✔  Reporte PDF guardado en: {pdf_path}")
