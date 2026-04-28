@@ -45,7 +45,7 @@ import warnings, shutil, os
 from fpdf import FPDF
 from datetime import datetime
 import yfinance as yf
-from statsmodels.tsa.arima.model import ARIMA
+from pmdarima import auto_arima
 from sklearn.metrics import root_mean_squared_error, mean_absolute_error
 import matplotlib.pyplot as plt
 
@@ -1706,18 +1706,17 @@ def apply_forecasts(p: dict) -> dict:
     for i, col in enumerate(["USDCOP", "EURCOP", "CHFCOP", "UST10Y"]):
         ts = df[col].values
 
-        # Modelo base ARIMA(1,1,0) para divisas, ARIMA(1,0,0) para tasas
-        order = (1,1,0) if col != "UST10Y" else (1,0,0)
         try:
-            model = ARIMA(ts, order=order).fit()
+            # Búsqueda automática de (p,d,q) con tendencia lineal para evitar pronósticos planos
+            model = auto_arima(ts, seasonal=False, suppress_warnings=True, trend='c')
+
             # Proyección a 5 años = ~1260 días de trading
-            fcast = model.get_forecast(steps=1260)
-            f_mean = fcast.predicted_mean
+            f_mean = model.predict(n_periods=1260)
 
             # Ajuste in-sample para medir errores
-            in_sample = model.predict(start=1, end=len(ts)-1)
-            rmse = root_mean_squared_error(ts[1:], in_sample)
-            mae = mean_absolute_error(ts[1:], in_sample)
+            in_sample = model.predict_in_sample()
+            rmse = root_mean_squared_error(ts[1:], in_sample[1:])
+            mae = mean_absolute_error(ts[1:], in_sample[1:])
 
             metrics.append({"Variable": col, "RMSE": rmse, "MAE": mae})
 
