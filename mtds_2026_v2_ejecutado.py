@@ -1642,10 +1642,10 @@ class MTDSPDF(FPDF):
         clean_text = clean_text.replace("│", "|").replace("─", "-")
         clean_text = clean_text.replace("⚠", "!!!").replace("✔", "OK")
         clean_text = clean_text.replace("ⓘ", "i")
-        
+
         # El ignore evita que el script se detenga si aparece otro caracter extraño
         clean_text = clean_text.encode('latin-1', 'ignore').decode('latin-1')
-        
+
         self.multi_cell(0, 5, clean_text)
         self.ln(5)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1667,7 +1667,7 @@ def main():
     print(f"\n[0b/6]  Leyendo Perfil de Vencimientos: {os.path.basename(PERFIL_PATH)}")
     perfil = load_from_perfil(PERFIL_PATH, oracle)
 
-    
+
 
     for msg in perfil["log"]:
         print(f"        {msg}")
@@ -1886,7 +1886,7 @@ def main():
     print("\n  Proceso MTDS 2026 completado.\n")
     # Variable para capturar logs del PDF
     pdf_content = ""
-    
+
     def log_print(text):
         nonlocal pdf_content
         print(text)
@@ -1907,7 +1907,7 @@ def main():
     # REGENERACIÓN DEL PDF
     log_print("\n[PDF] Generando Reporte Ejecutivo en PDF …")
     pdf = MTDSPDF()
-    
+
     pdf.add_page()
     pdf.chapter_title("1. ESTADÍSTICAS CONSULTA ORACLE (DEUDA EXTERNA)")
     if oracle["ok"] and oracle.get("report"):
@@ -1962,7 +1962,7 @@ def main():
     metrics_report.append(f"  CVaR 95%:                    {mc['cvar95']:.3f}%")
     metrics_report.append("=" * 70)
     pdf.add_terminal_text("\n".join(metrics_report))
-    
+
     pdf_path = r"MTDS_2026_Reporte_Ejecutivo.pdf"
     pdf.output(pdf_path)
     print(f"       ✔  Reporte PDF guardado en: {pdf_path}")
