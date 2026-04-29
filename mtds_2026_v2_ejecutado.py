@@ -354,6 +354,58 @@ def load_from_oracle(oracle_path: str) -> dict:
     return result
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 3.5. LECTOR DE EMISIONES VIGENTES (xlsx)
+# ══════════════════════════════════════════════════════════════════════════════
+def load_from_emisiones(path: str) -> dict:
+    """
+    Lee Emisiones Vigentes 03.xlsx y consolida la deuda interna por moneda
+    (COP, UVR) obteniendo saldos y las tasas cupón ponderadas (TASA).
+    """
+    result = {"ok": False, "log": [], "data": {}}
+    if not os.path.exists(path):
+        result["log"].append(f"⚠  Emisiones Vigentes no encontrado: '{path}'")
+        return result
+
+    try:
+        df = pd.read_excel(path)
+        df['Den'] = df['Den'].ffill()
+        df = df[~df['Den'].astype(str).str.contains('Total')]
+        df['Tipo Tasa'] = df['Tipo Tasa'].replace({'Total CP': None, 'Total Fija': None}).ffill()
+        df = df.dropna(subset=['Suma de Valor Nominal $', 'TASA'])
+
+        def weighted_average(group, avg_name, weight_name):
+            d = group[avg_name]
+            w = group[weight_name]
+            if w.sum() == 0: return 0
+            return (d * w).sum() / w.sum()
+
+        res = df.groupby(['Den', 'Tipo Tasa']).apply(
+            lambda x: pd.Series({
+                'Saldo': x['Suma de Valor Nominal $'].sum(),
+                'Tasa_WP': weighted_average(x, 'TASA', 'Suma de Valor Nominal $')
+            }),
+            include_groups=False
+        ).reset_index()
+
+        # Agrupar COP total vs UVR total
+        cop_saldo = res[res['Den'] == 'COP']['Saldo'].sum()
+        if cop_saldo > 0:
+            cop_tasa_wp = (res[res['Den'] == 'COP']['Tasa_WP'] * res[res['Den'] == 'COP']['Saldo']).sum() / cop_saldo
+            result["data"]["COP"] = {"Saldo": cop_saldo, "Tasa_WP": cop_tasa_wp}
+
+        uvr_saldo = res[res['Den'] == 'UVR']['Saldo'].sum()
+        if uvr_saldo > 0:
+            uvr_tasa_wp = (res[res['Den'] == 'UVR']['Tasa_WP'] * res[res['Den'] == 'UVR']['Saldo']).sum() / uvr_saldo
+            result["data"]["UVR"] = {"Saldo": uvr_saldo, "Tasa_WP": uvr_tasa_wp}
+
+        result["ok"] = True
+        result["log"].append(f"✔  Emisiones Vigentes cargado: {cop_saldo/1e12:.1f}T COP, {uvr_saldo/1e12:.1f}T UVR")
+    except Exception as e:
+        result["log"].append(f"⚠  Error leyendo Emisiones Vigentes: {e}")
+
+    return result
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 4. LECTOR DE PERFIL DE VENCIMIENTOS  (xlsm)
 # ══════════════════════════════════════════════════════════════════════════════
 def load_from_perfil(perfil_path: str, oracle_result: dict = None) -> dict:
@@ -1827,14 +1879,29 @@ def apply_forecasts(p: dict) -> dict:
     forecasts = {}
     metrics = []
 
+    exog_cols = []
+    if exog_data is not None:
+        macro_labels = ["Inflacion", "TasaBanRep"]
+        for j, lab in enumerate(macro_labels):
+            if j < exog_data.shape[1]:
+                df[lab] = exog_data[:, j]
+                exog_cols.append(lab)
+
+    vars_to_forecast = ["USDCOP", "EURCOP", "CHFCOP", "UST10Y"] + exog_cols
+
     print("        Evaluando modelos ML / SARIMAX para el mejor pronóstico...")
-    plt.figure(figsize=(15, 10))
-    for i, col in enumerate(["USDCOP", "EURCOP", "CHFCOP", "UST10Y"]):
+    n_vars = len(vars_to_forecast)
+    rows = 3 if n_vars > 4 else 2
+    plt.figure(figsize=(15, rows * 5))
+
+    for i, col in enumerate(vars_to_forecast):
         ts = df[col].values
 
         try:
             # Seleccionar y proyectar 5 años (1260 días)
-            f_simulated, best_model_name, rmse, mae = evaluate_models_and_forecast(ts, steps=1260, exog=exog_data)
+            # Para variables exógenas en sí mismas (Inflacion, TasaBanRep) se pronostican solas
+            use_exog = exog_data if col in ["USDCOP", "EURCOP", "CHFCOP", "UST10Y"] else None
+            f_simulated, best_model_name, rmse, mae = evaluate_models_and_forecast(ts, steps=1260, exog=use_exog)
 
             # Guardar pronósticos puros para volcado Excel
             forecasts[col] = f_simulated
@@ -1845,7 +1912,7 @@ def apply_forecasts(p: dict) -> dict:
             })
 
             # Graficar
-            plt.subplot(2, 2, i+1)
+            plt.subplot(rows, 2, i+1)
             plt.plot(ts, label="Histórico", color="navy")
             plt.plot(range(len(ts), len(ts)+1260), f_simulated, label=f"Proyección ({best_model_name})", color="red", linestyle="--")
             plt.title(f"{col} - Mejor Modelo: {best_model_name}")
@@ -1866,6 +1933,8 @@ def apply_forecasts(p: dict) -> dict:
                 p["chfcop_spot"] = ts[-1]
             elif col == "UST10Y":
                 p["usd_fixed_rate"] = f_simulated[-1]
+            elif col == "Inflacion":
+                p["uvr_inflation"] = f_simulated[-1]
 
         except Exception as e:
             print(f"        Error proyectando {col}: {e}")
@@ -1912,14 +1981,20 @@ def main():
     for msg in perfil["log"]:
         print(f"        {msg}")
 
-    # ── [0c] Plantilla Bloomberg ───────────────────────────────────────────
-    print(f"\n[0c/6]  Leyendo Plantilla Bloomberg: {os.path.basename(TEMPLATE_PATH)}")
+    # ── [0c] Emisiones Vigentes (Deuda Interna) ───────────────────────────
+    print(f"\n[0c/6]  Leyendo Emisiones Vigentes: Emisiones Vigentes 03.xlsx")
+    emisiones = load_from_emisiones("Emisiones Vigentes 03.xlsx")
+    for msg in emisiones["log"]:
+        print(f"        {msg}")
+
+    # ── [0d] Plantilla Bloomberg ───────────────────────────────────────────
+    print(f"\n[0d/6]  Leyendo Plantilla Bloomberg: {os.path.basename(TEMPLATE_PATH)}")
     tpl = load_from_template(TEMPLATE_PATH)
     for msg in tpl["log"]:
         print(f"        {msg}")
 
-    # ── [0d] YAHOO FINANCE FORECASTS ───────────────────────────────────────
-    # Prioridad: Oracle (datos reales) > Bloomberg template > PARAMS default
+    # ── [0e] YAHOO FINANCE FORECASTS ───────────────────────────────────────
+    # Prioridad: Oracle/Emisiones (datos reales) > Bloomberg template > PARAMS default
     p = tpl["params"]
 
     forecast_results = apply_forecasts(p)
@@ -1954,7 +2029,14 @@ def main():
             p["cop_fixed_rate"] = max(p["cop_fixed_rate"],
                                       oracle_rates["DI_COP_EXT"]["tasa_wp"])
 
-    print(f"\n       Parámetros activos (tasas/spreads desde Oracle + Bloomberg):")
+    # Sobrescribir tasas COP y UVR con los promedios ponderados de Emisiones Vigentes
+    if emisiones["ok"]:
+        if "COP" in emisiones["data"]:
+            p["cop_fixed_rate"] = emisiones["data"]["COP"]["Tasa_WP"]
+        if "UVR" in emisiones["data"]:
+            p["uvr_real_rate"] = emisiones["data"]["UVR"]["Tasa_WP"]
+
+    print(f"\n       Parámetros activos (tasas/spreads desde datos reales Oracle/Emisiones):")
     key_show = [
         ("cop_fixed_rate",   "TES COP (%)"),
         ("uvr_real_rate",    "TES UVR real (%)"),
@@ -1988,14 +2070,23 @@ def main():
             portfolio[inst_id]["pct_vto_1"] = perfil["pct_amort_yr1"].get(inst_id, None)
 
     # ── Pesos de referencia: composición actual del portafolio ────────────
-    # Construimos ref_weights desde Oracle (externo) + lineamiento interno
+    # Construimos ref_weights desde Oracle (externo) y Emisiones Vigentes (interno)
     if oracle["ok"] and oracle["oracle_weights"]:
-        # Externo: proporciones del Oracle dentro del 40 % externo
-        # Interno: 60 % dividido 60/40 COP/UVR (lineamiento actual)
-        ext_total = 0.40   # lineamiento nuevo
-        int_total = 0.60
-        int_cop   = int_total * 0.70   # ~70% del interno en COP
-        int_uvr   = int_total * 0.30   # ~30% del interno en UVR
+        ext_total = 0.40   # lineamiento nuevo general externo
+        int_total = 0.60   # lineamiento nuevo general interno
+
+        if emisiones["ok"] and "COP" in emisiones["data"] and "UVR" in emisiones["data"]:
+            # Distribución interna real basada en los saldos
+            total_interno_real = emisiones["data"]["COP"]["Saldo"] + emisiones["data"]["UVR"]["Saldo"]
+            pct_cop_real = emisiones["data"]["COP"]["Saldo"] / total_interno_real
+            pct_uvr_real = emisiones["data"]["UVR"]["Saldo"] / total_interno_real
+            int_cop = int_total * pct_cop_real
+            int_uvr = int_total * pct_uvr_real
+        else:
+            # Fallback 70/30
+            int_cop = int_total * 0.70
+            int_uvr = int_total * 0.30
+
         ow = oracle["oracle_weights"]
         ref_w = np.array([
             int_cop,                              # DI_COP_F
