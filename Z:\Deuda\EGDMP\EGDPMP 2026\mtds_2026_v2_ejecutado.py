@@ -1648,10 +1648,10 @@ class MTDSPDF(FPDF):
         clean_text = clean_text.replace("│", "|").replace("─", "-")
         clean_text = clean_text.replace("⚠", "!!!").replace("✔", "OK")
         clean_text = clean_text.replace("ⓘ", "i")
-        
+
         # El ignore evita que el script se detenga si aparece otro caracter extraño
         clean_text = clean_text.encode('latin-1', 'ignore').decode('latin-1')
-        
+
         self.multi_cell(0, 5, clean_text)
         self.ln(5)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1673,7 +1673,7 @@ def main():
     print(f"\n[0b/6]  Leyendo Perfil de Vencimientos: {os.path.basename(PERFIL_PATH)}")
     perfil = load_from_perfil(PERFIL_PATH, oracle)
 
-    
+
 
     for msg in perfil["log"]:
         print(f"        {msg}")
@@ -1918,7 +1918,7 @@ def main():
     print("\n  Proceso MTDS 2026 completado.\n")
     # Variable para capturar logs del PDF
     pdf_content = ""
-    
+
     def log_print(text):
         nonlocal pdf_content
         print(text)
@@ -1944,11 +1944,11 @@ def main():
     log_print("\n[PDF] Generando Reporte Ejecutivo en PDF …")
     pdf = MTDSPDF()
     pdf.add_page()
-    
+
     # Dividir el contenido por secciones lógicas si lo deseas, o simplemente todo:
     pdf.chapter_title("RESUMEN DE EJECUCIÓN Y PARÁMETROS")
     pdf.add_terminal_text(pdf_content)
-    
+
     pdf_path = r"Z:\Deuda\EGDMP\EGDPMP 2026\MTDS_2026_Reporte_Ejecutivo.pdf"
     pdf.output(pdf_path)
     print(f"       ✔  Reporte PDF guardado en: {pdf_path}")

@@ -798,14 +798,7 @@ def deterministic_cost(w: np.ndarray, p: dict, shock: dict) -> dict:
     }
 
     weighted_rate = sum(w[i] * rates[INSTRUMENTS[i][0]] for i in range(N_INST))
-
-    # Nuevo cálculo basado en valores absolutos y escalado a la meta exacta
-    absolute_cost = weighted_rate * p["total_absolute_debt"]
-    if p.get("model_base_cost", 0) > 0:
-        int_pct_gdp = absolute_cost * (p["target_int_pct_gdp"] / p["model_base_cost"])
-    else:
-        int_pct_gdp = weighted_rate * p.get("debt_pct_gdp", 55.0)  # fallback
-
+    int_pct_gdp   = weighted_rate * p["debt_pct_gdp"]
     int_pct_rev   = int_pct_gdp / p["revenues_pct_gdp"] * 100
 
     return {
@@ -960,13 +953,7 @@ class CostRiskCalc:
             chf_v = w[7] * (rates[:, t, 7] + p["chf_spread_saron"]) / 100 * adj_chf
 
             cost_t = cop_cost + uvr_cost + usd_f + eur_f + eur_v + usd_v + chf_f + chf_v
-
-            # Cálculo con saldos absolutos para escalado preciso
-            if "model_base_cost" in p and p["model_base_cost"] > 0:
-                absolute_cost_t = cost_t * p["total_absolute_debt"]
-                ip[:, t] = absolute_cost_t * (p["target_int_pct_gdp"] / p["model_base_cost"])
-            else:
-                ip[:, t] = cost_t * p.get("debt_pct_gdp", 55.0)
+            ip[:, t] = cost_t * p["debt_pct_gdp"]
 
         return ip.mean(axis=1)   # promedio del horizonte → [n]
 
@@ -1022,11 +1009,7 @@ class CostRiskCalc:
                     w[5]*(rates[scen_i,t,5]+p["usd_spread_sofr"])/100*adj_usd +
                     w[6]*rates[scen_i,t,4]/100*adj_chf +
                     w[7]*(rates[scen_i,t,7]+p["chf_spread_saron"])/100*adj_chf
-                )
-                if "model_base_cost" in p and p["model_base_cost"] > 0:
-                    c = (c * p["total_absolute_debt"]) * (p["target_int_pct_gdp"] / p["model_base_cost"])
-                else:
-                    c = c * p.get("debt_pct_gdp", 55.0)
+                ) * p["debt_pct_gdp"]
                 row[f"Int_PIB_Año{2026+t}"] = round(c, 5)
                 costs_yr.append(c)
                 # Tasas de mercado en este escenario
@@ -1648,10 +1631,10 @@ class MTDSPDF(FPDF):
         clean_text = clean_text.replace("│", "|").replace("─", "-")
         clean_text = clean_text.replace("⚠", "!!!").replace("✔", "OK")
         clean_text = clean_text.replace("ⓘ", "i")
-        
+
         # El ignore evita que el script se detenga si aparece otro caracter extraño
         clean_text = clean_text.encode('latin-1', 'ignore').decode('latin-1')
-        
+
         self.multi_cell(0, 5, clean_text)
         self.ln(5)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1673,7 +1656,7 @@ def main():
     print(f"\n[0b/6]  Leyendo Perfil de Vencimientos: {os.path.basename(PERFIL_PATH)}")
     perfil = load_from_perfil(PERFIL_PATH, oracle)
 
-    
+
 
     for msg in perfil["log"]:
         print(f"        {msg}")
@@ -1690,47 +1673,6 @@ def main():
     n_scenarios = int(p.pop("n_scenarios", 1000))
     horizon     = int(p.pop("horizon", 5))
     lam         = float(p.pop("risk_aversion", 1.5))
-
-    # ── [NEW] Extraer saldos y costos absolutos de Emisiones Vigentes y Oracle ──
-    try:
-        # Check if the file exists in the same directory as the script instead of PERFIL_PATH
-        # Fallback to local 'Emisiones Vigentes 03.xlsx' since the absolute path isn't guaranteed
-        emis_path = PERFIL_PATH.replace('Perfil de vencimientos 2026.xlsm', 'Emisiones Vigentes 03.xlsx')
-        if not os.path.exists(emis_path):
-             emis_path = 'Emisiones Vigentes 03.xlsx'
-        df_emis = pd.read_excel(emis_path)
-        df_emis['Suma de SALDO'] = pd.to_numeric(df_emis['Suma de SALDO'], errors='coerce').fillna(0)
-        df_emis['TASA'] = pd.to_numeric(df_emis['TASA'], errors='coerce').fillna(0)
-        total_emis_saldo = df_emis['Suma de SALDO'].sum()
-        raw_int_cost = (df_emis['Suma de SALDO'] * (df_emis['TASA'] / 100)).sum()
-    except Exception as e:
-        print(f"Error leyendo Emisiones Vigentes: {e}")
-        total_emis_saldo = 0
-        raw_int_cost = 0
-
-    try:
-        # Load the oracle CSV which is actually tab separated
-        oracle_path_actual = ORACLE_PATH if os.path.exists(ORACLE_PATH) else 'Consulta Oracle 31-03-2026.xls'
-        df_oracle = pd.read_csv(oracle_path_actual, sep='\t', encoding='utf-8')
-        df_oracle['SDO_US'] = pd.to_numeric(df_oracle['SDO_US'], errors='coerce').fillna(0)
-        df_oracle['MARGEN_VALOR'] = pd.to_numeric(df_oracle['MARGEN_VALOR'], errors='coerce').fillna(0)
-        total_oracle_saldo_usd = df_oracle['SDO_US'].sum()
-        raw_ext_cost_usd = (df_oracle['SDO_US'] * (df_oracle['MARGEN_VALOR'] / 100)).sum()
-    except Exception as e:
-        print(f"Error leyendo Oracle raw: {e}")
-        total_oracle_saldo_usd = 0
-        raw_ext_cost_usd = 0
-
-    # Guardar en p para reemplazar p["debt_pct_gdp"]
-    p["total_absolute_debt"] = total_emis_saldo + total_oracle_saldo_usd * p.get("usdcop_spot", 4200.0)
-    p["raw_base_cost_cop"] = raw_int_cost + raw_ext_cost_usd * p.get("usdcop_spot", 4200.0)
-    # The actual absolute target for "Intereses totales" is 833,073,359.49
-    # The required base Intereses/PIB should reflect this mathematically over the 1998508.0 GDP.
-    # Percentage is target / GDP / 10.
-    # Instruction specifies to respect base GDP of 1998508.0
-    p["target_int_pct_gdp"] = 833073359.49 / 1998508.0 / 10
-
-
 
     # Sobrescribir tasas/spreads con datos reales de Oracle
     if oracle["ok"]:
@@ -1819,22 +1761,6 @@ def main():
         print(f"         {m_label:<18} {inst[2]:<5} {inst[3]:<10} {ref_w[i]*100:>6.1f}%")
         prev_m = inst[1]
 
-    # Calculate what the model evaluates the base cost as
-    # So we can scale ANY scenario precisely relative to the model's own evaluation of the base
-    w_base = ref_w
-    rates_base = {
-        "DI_COP_F": p["cop_fixed_rate"]/100,
-        "DI_UVR_F": (p["uvr_real_rate"] + p.get("uvr_inflation", 4.5))/100,
-        "DE_USD_F": p["usd_fixed_rate"]/100,
-        "DE_EUR_F": p["eur_fixed_rate"]/100,
-        "DE_EUR_V": (p.get("euribor_base",3.0) + p["eur_spread_eurib"])/100,
-        "DE_USD_V": (p.get("sofr_base",4.5) + p["usd_spread_sofr"])/100,
-        "DE_CHF_F": p["chf_fixed_rate"]/100,
-        "DE_CHF_V": (p.get("saron_base",1.2) + p["chf_spread_saron"])/100,
-    }
-    weighted_rate_base = sum(w_base[i] * rates_base[INSTRUMENTS[i][0]] for i in range(N_INST))
-    p["model_base_cost"] = weighted_rate_base * p["total_absolute_debt"]
-
     # ── [1] Generar / actualizar plantilla Bloomberg ───────────────────────
     print("\n[1/6]  Generando plantilla Bloomberg (5 hojas) …")
     tmpl_out = r"Z:\Deuda\EGDMP\EGDPMP 2026\MTDS_Bloomberg_Template.xlsx"
@@ -1843,7 +1769,6 @@ def main():
 
     # ── [2] Escenarios de estrés deterministas (BM-FMI Apéndice III) ──────
     print("\n[2/6]  Calculando escenarios de estrés BM-FMI …")
-
     stres_ref = stress_analysis(ref_w, p)
     print(f"       Portafolio referencia — Base: "
           f"{stres_ref['base']['int_pct_gdp']:.3f}% PIB  |  "
@@ -1918,7 +1843,7 @@ def main():
     print("\n  Proceso MTDS 2026 completado.\n")
     # Variable para capturar logs del PDF
     pdf_content = ""
-    
+
     def log_print(text):
         nonlocal pdf_content
         print(text)
@@ -1932,23 +1857,30 @@ def main():
     log_print(f"  TPV (años):                  {port['TPV_años']:.2f}")
     log_print(f"  TPR (años):                  {port['TPR_años']:.2f}")
     log_print(f"  % Deuda FX (externo):        {port['pct_FX']:.1f}%")
-    # Intereses absolutos totales is the exact target total!
-    log_print(f"  Intereses absolutos totales: $833,073,359.49 COP")
     log_print(f"  Intereses/PIB (base):        {stress['base']['int_pct_gdp']:.3f}%")
     log_print(f"  CVaR 95%:                    {mc['cvar95']:.3f}%")
     log_print("=" * 70)
 
+    # REGENERACIÓN DEL PDF
+    log_print("\n[PDF] Finalizando Reporte Ejecutivo …")
+    pdf = MTDSPDF()
+    pdf.add_page()
 
+    pdf.chapter_title("1. RESULTADOS DE LA ESTRATEGIA OPTIMIZADA")
+    pdf.add_terminal_text(pdf_content)
+
+    pdf_path = r"Z:\Deuda\EGDMP\EGDPMP 2026\MTDS_2026_Reporte_Ejecutivo.pdf"
+    pdf.output(pdf_path)
 
     # Al final del main, después de guardar el Excel:
     log_print("\n[PDF] Generando Reporte Ejecutivo en PDF …")
     pdf = MTDSPDF()
     pdf.add_page()
-    
+
     # Dividir el contenido por secciones lógicas si lo deseas, o simplemente todo:
     pdf.chapter_title("RESUMEN DE EJECUCIÓN Y PARÁMETROS")
     pdf.add_terminal_text(pdf_content)
-    
+
     pdf_path = r"Z:\Deuda\EGDMP\EGDPMP 2026\MTDS_2026_Reporte_Ejecutivo.pdf"
     pdf.output(pdf_path)
     print(f"       ✔  Reporte PDF guardado en: {pdf_path}")
