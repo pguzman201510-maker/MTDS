@@ -45,6 +45,7 @@ import warnings, shutil, os
 from fpdf import FPDF
 from datetime import datetime
 import yfinance as yf
+import pandas_datareader.data as web
 from pmdarima import auto_arima
 from sklearn.metrics import root_mean_squared_error, mean_absolute_error
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
@@ -1683,11 +1684,11 @@ class MTDSPDF(FPDF):
 # ══════════════════════════════════════════════════════════════════════════════
 # 10.5 FORECASTING (YAHOO FINANCE + ARIMA)
 # ══════════════════════════════════════════════════════════════════════════════
-def evaluate_models_and_forecast(ts, steps=1260, lags=10):
+def evaluate_models_and_forecast(ts, steps=1260, lags=10, exog=None):
     """
-    Entrena diferentes modelos de machine learning (y AutoARIMA),
+    Entrena diferentes modelos de machine learning y SARIMAX (con variables exógenas),
     los evalúa con un split 80/20 out-of-sample, selecciona el mejor,
-    y genera el pronóstico hacia el futuro con ruido aleatorio.
+    y genera el pronóstico hacia el futuro con ruido aleatorio (para outliers).
     """
     if len(ts.shape) > 1:
         ts = ts.ravel()
@@ -1734,27 +1735,37 @@ def evaluate_models_and_forecast(ts, steps=1260, lags=10):
         except Exception:
             pass
 
-    # 2. Evaluar AutoARIMA
+    # 2. Evaluar AutoARIMA / SARIMAX
+    exog_train, exog_test = None, None
+    if exog is not None and len(exog) == len(ts):
+        exog_train = exog[:split_idx]
+        exog_test = exog[split_idx:]
+
     try:
-        arima_model = auto_arima(ts_train, seasonal=False, suppress_warnings=True, trend='c')
-        arima_preds = arima_model.predict(n_periods=len(ts_test))
+        arima_model = auto_arima(ts_train, exogenous=exog_train, seasonal=False, suppress_warnings=True, trend='c')
+        arima_preds = arima_model.predict(n_periods=len(ts_test), exogenous=exog_test)
         arima_rmse = root_mean_squared_error(ts_test, arima_preds)
         if arima_rmse < best_rmse:
             best_rmse = arima_rmse
             best_mae = mean_absolute_error(ts_test, arima_preds)
-            best_name = "AutoARIMA"
+            best_name = "SARIMAX" if exog is not None else "AutoARIMA"
     except Exception:
         pass
 
     # 3. Generar pronóstico real a futuro (agregando ruido para volatilidad)
-    if best_name == "AutoARIMA":
-        model = auto_arima(ts, seasonal=False, suppress_warnings=True, trend='c')
-        f_mean = model.predict(n_periods=steps)
+    if best_name in ("AutoARIMA", "SARIMAX"):
+        model = auto_arima(ts, exogenous=exog, seasonal=False, suppress_warnings=True, trend='c')
+
+        future_exog = None
+        if exog is not None:
+            future_exog = np.repeat(exog[-1:], steps, axis=0)
+
+        f_mean = model.predict(n_periods=steps, exogenous=future_exog)
         resids = model.resid()
         noise = np.random.choice(resids, size=steps)
         f_simulated = f_mean + noise
 
-        in_sample = model.predict_in_sample()
+        in_sample = model.predict_in_sample(exogenous=exog)
         rmse_in = root_mean_squared_error(ts[1:], in_sample[1:])
         mae_in = mean_absolute_error(ts[1:], in_sample[1:])
         return np.array(f_simulated), best_name, rmse_in, mae_in
@@ -1786,7 +1797,8 @@ def evaluate_models_and_forecast(ts, steps=1260, lags=10):
 def apply_forecasts(p: dict) -> dict:
     """
     Descarga histórico 5Y de USD/COP, EUR/USD, CHF/USD, y US Treasury 10Y.
-    Evalúa algoritmos Machine Learning para proyectar trayectorias realistas (no planas).
+    Descarga datos macro de FRED (Inflación, Tasa BanRep, PIB) como variables exógenas.
+    Evalúa algoritmos Machine Learning y SARIMAX para proyectar trayectorias realistas.
     """
     print("\n[  *  ] Conectando a Yahoo Finance para extraer histórico 5Y...")
     tickers = ['COP=X', 'EURUSD=X', 'CHFUSD=X', '^TNX']
@@ -1800,17 +1812,32 @@ def apply_forecasts(p: dict) -> dict:
 
     df = data[["USDCOP", "EURCOP", "CHFCOP", "UST10Y"]].dropna()
 
+    print("        Descargando variables macro (FRED) para modelo SARIMAX...")
+    try:
+        start_date = df.index.min()
+        end_date = df.index.max()
+        # FPCPITOTLZGCOL (Inflación anual), IRSTCB01COM156N (BanRep)
+        macro = web.DataReader(['FPCPITOTLZGCOL', 'IRSTCB01COM156N'], 'fred', start_date, end_date)
+        macro = macro.reindex(df.index, method='ffill').bfill()
+        exog_data = macro.values
+    except Exception as e:
+        print(f"        [!] Error descargando FRED exog: {e}. Se ignorarán en SARIMAX.")
+        exog_data = None
+
     forecasts = {}
     metrics = []
 
-    print("        Evaluando modelos Machine Learning / ARIMA para el mejor pronóstico...")
+    print("        Evaluando modelos ML / SARIMAX para el mejor pronóstico...")
     plt.figure(figsize=(15, 10))
     for i, col in enumerate(["USDCOP", "EURCOP", "CHFCOP", "UST10Y"]):
         ts = df[col].values
 
         try:
             # Seleccionar y proyectar 5 años (1260 días)
-            f_simulated, best_model_name, rmse, mae = evaluate_models_and_forecast(ts, steps=1260)
+            f_simulated, best_model_name, rmse, mae = evaluate_models_and_forecast(ts, steps=1260, exog=exog_data)
+
+            # Guardar pronósticos puros para volcado Excel
+            forecasts[col] = f_simulated
 
             metrics.append({
                 "Variable": col, "Modelo": best_model_name,
@@ -1858,7 +1885,7 @@ def apply_forecasts(p: dict) -> dict:
     log += f"  Tasa USD Fija base proy: {p['usd_fixed_rate']:.2f}%\n"
     log += f"  Gráfico guardado en: {plot_path}\n"
 
-    return {"p": p, "log": log, "plot": plot_path}
+    return {"p": p, "log": log, "plot": plot_path, "forecasts": forecasts}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1898,6 +1925,8 @@ def main():
     forecast_results = apply_forecasts(p)
     p = forecast_results["p"]
     print(forecast_results["log"])
+
+    df_forecasts = pd.DataFrame(forecast_results["forecasts"])
 
     n_scenarios = int(p.pop("n_scenarios", 1000))
     horizon     = int(p.pop("horizon", 5))
@@ -2160,7 +2189,7 @@ def main():
     # but since save_results saves and closes, we do it after.
     save_results(w_opt, mc, stress, port, frontier, res_path, df_scenarios=df_scenarios_1000, p_dict=p)
 
-    # Append the new sheets 1000_Estrategias and Alternativas_Int_Ext
+    # Append the new sheets 1000_Estrategias, Alternativas_Int_Ext, and Proyecciones_Variables
     from openpyxl.utils.dataframe import dataframe_to_rows
     wb = load_workbook(res_path)
 
@@ -2172,10 +2201,14 @@ def main():
     for r in dataframe_to_rows(df_alts, index=False, header=True):
         ws_alts.append(r)
 
+    ws_proy = wb.create_sheet("Proyecciones_Variables")
+    for r in dataframe_to_rows(df_forecasts, index=False, header=True):
+        ws_proy.append(r)
+
     wb.save(res_path)
     wb.close()
 
-    print(f"       ✔  {res_path} (Incluyendo 1000 Estrategias y Alternativas Int/Ext)")
+    print(f"       ✔  {res_path} (Incluyendo 1000 Estrategias, Alternativas Int/Ext y Proyecciones)")
 
     print("\n[6/6]  Copiando script a outputs …")
     shutil.copy(__file__, r"mtds_2026_v2_ejecutado.py")
