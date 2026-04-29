@@ -47,6 +47,8 @@ from datetime import datetime
 import yfinance as yf
 from pmdarima import auto_arima
 from sklearn.metrics import root_mean_squared_error, mean_absolute_error
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression
 import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
@@ -1681,10 +1683,110 @@ class MTDSPDF(FPDF):
 # ══════════════════════════════════════════════════════════════════════════════
 # 10.5 FORECASTING (YAHOO FINANCE + ARIMA)
 # ══════════════════════════════════════════════════════════════════════════════
+def evaluate_models_and_forecast(ts, steps=1260, lags=10):
+    """
+    Entrena diferentes modelos de machine learning (y AutoARIMA),
+    los evalúa con un split 80/20 out-of-sample, selecciona el mejor,
+    y genera el pronóstico hacia el futuro con ruido aleatorio.
+    """
+    if len(ts.shape) > 1:
+        ts = ts.ravel()
+    diff_ts = np.diff(ts)
+    X, y = [], []
+    for i in range(lags, len(diff_ts)):
+        X.append(diff_ts[i-lags:i])
+        y.append(diff_ts[i])
+    X, y = np.array(X), np.array(y)
+
+    split_idx = int(len(ts) * 0.8)
+    ts_train, ts_test = ts[:split_idx], ts[split_idx:]
+
+    ml_split = split_idx - lags - 1
+    if ml_split < 0: ml_split = int(len(X)*0.8)
+    X_train, y_train = X[:ml_split], y[:ml_split]
+    X_test, y_test = X[ml_split:], y[ml_split:]
+
+    models = {
+        "RandomForest": RandomForestRegressor(n_estimators=50, random_state=42),
+        "GradientBoosting": GradientBoostingRegressor(n_estimators=50, random_state=42),
+        "LinearRegression": LinearRegression()
+    }
+
+    best_name = None
+    best_rmse = np.inf
+    best_mae = np.inf
+    best_model = None
+
+    # 1. Evaluar modelos ML (predeciendo diferencias)
+    for name, m in models.items():
+        try:
+            m.fit(X_train, y_train)
+            preds_diff = m.predict(X_test)
+            reconstructed = [ts_train[-1]]
+            for d in preds_diff:
+                reconstructed.append(reconstructed[-1] + d)
+            rmse = root_mean_squared_error(ts_test[:len(preds_diff)], reconstructed[1:len(preds_diff)+1])
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_mae = mean_absolute_error(ts_test[:len(preds_diff)], reconstructed[1:len(preds_diff)+1])
+                best_name = name
+                best_model = m
+        except Exception:
+            pass
+
+    # 2. Evaluar AutoARIMA
+    try:
+        arima_model = auto_arima(ts_train, seasonal=False, suppress_warnings=True, trend='c')
+        arima_preds = arima_model.predict(n_periods=len(ts_test))
+        arima_rmse = root_mean_squared_error(ts_test, arima_preds)
+        if arima_rmse < best_rmse:
+            best_rmse = arima_rmse
+            best_mae = mean_absolute_error(ts_test, arima_preds)
+            best_name = "AutoARIMA"
+    except Exception:
+        pass
+
+    # 3. Generar pronóstico real a futuro (agregando ruido para volatilidad)
+    if best_name == "AutoARIMA":
+        model = auto_arima(ts, seasonal=False, suppress_warnings=True, trend='c')
+        f_mean = model.predict(n_periods=steps)
+        resids = model.resid()
+        noise = np.random.choice(resids, size=steps)
+        f_simulated = f_mean + noise
+
+        in_sample = model.predict_in_sample()
+        rmse_in = root_mean_squared_error(ts[1:], in_sample[1:])
+        mae_in = mean_absolute_error(ts[1:], in_sample[1:])
+        return np.array(f_simulated), best_name, rmse_in, mae_in
+    else:
+        best_model.fit(X, y)
+        fitted = best_model.predict(X)
+        resids = y - fitted
+
+        forecast_diffs = []
+        curr_lags = diff_ts[-lags:].tolist()
+        noise_std = np.std(resids)
+
+        for _ in range(steps):
+            pred_diff = best_model.predict([curr_lags])[0]
+            pred_diff += np.random.normal(0, noise_std)
+            forecast_diffs.append(pred_diff)
+            curr_lags.append(pred_diff)
+            curr_lags.pop(0)
+
+        forecast = [ts[-1]]
+        for d in forecast_diffs:
+            forecast.append(forecast[-1] + d)
+
+        rmse_in = root_mean_squared_error(diff_ts[lags:], fitted) # Proxy in-sample differences
+        mae_in = mean_absolute_error(diff_ts[lags:], fitted)
+        return np.array(forecast[1:]), best_name, rmse_in, mae_in
+
+
 def apply_forecasts(p: dict) -> dict:
     """
     Descarga histórico 5Y de USD/COP, EUR/USD, CHF/USD, y US Treasury 10Y.
-    Construye modelos ARIMA para proyectar drift esperado.
+    Evalúa algoritmos Machine Learning para proyectar trayectorias realistas (no planas).
     """
     print("\n[  *  ] Conectando a Yahoo Finance para extraer histórico 5Y...")
     tickers = ['COP=X', 'EURUSD=X', 'CHFUSD=X', '^TNX']
@@ -1701,51 +1803,45 @@ def apply_forecasts(p: dict) -> dict:
     forecasts = {}
     metrics = []
 
-    print("        Ajustando modelos ARIMA y calculando errores...")
+    print("        Evaluando modelos Machine Learning / ARIMA para el mejor pronóstico...")
     plt.figure(figsize=(15, 10))
     for i, col in enumerate(["USDCOP", "EURCOP", "CHFCOP", "UST10Y"]):
         ts = df[col].values
 
         try:
-            # Búsqueda automática de (p,d,q) con tendencia lineal para evitar pronósticos planos
-            model = auto_arima(ts, seasonal=False, suppress_warnings=True, trend='c')
+            # Seleccionar y proyectar 5 años (1260 días)
+            f_simulated, best_model_name, rmse, mae = evaluate_models_and_forecast(ts, steps=1260)
 
-            # Proyección a 5 años = ~1260 días de trading
-            f_mean = model.predict(n_periods=1260)
-
-            # Ajuste in-sample para medir errores
-            in_sample = model.predict_in_sample()
-            rmse = root_mean_squared_error(ts[1:], in_sample[1:])
-            mae = mean_absolute_error(ts[1:], in_sample[1:])
-
-            metrics.append({"Variable": col, "RMSE": rmse, "MAE": mae})
+            metrics.append({
+                "Variable": col, "Modelo": best_model_name,
+                "RMSE": rmse, "MAE": mae
+            })
 
             # Graficar
             plt.subplot(2, 2, i+1)
             plt.plot(ts, label="Histórico", color="navy")
-            plt.plot(range(len(ts), len(ts)+1260), f_mean, label="Proyección", color="red", linestyle="--")
-            plt.title(f"{col} - RMSE: {rmse:.4f}")
+            plt.plot(range(len(ts), len(ts)+1260), f_simulated, label=f"Proyección ({best_model_name})", color="red", linestyle="--")
+            plt.title(f"{col} - Mejor Modelo: {best_model_name}")
             plt.legend()
 
+            # Actualizar drift a 5 años en los parámetros
             if col == "USDCOP":
-                # Calcular drift promedio esperado
-                # Drift = log(E_T / E_0) / T
-                drift_pct = (np.log(f_mean[-1] / ts[-1]) / 5.0) * 100
+                drift_pct = (np.log(f_simulated[-1] / ts[-1]) / 5.0) * 100
                 p["usdcop_drift"] = drift_pct
                 p["usdcop_spot"] = ts[-1]
             elif col == "EURCOP":
-                drift_pct = (np.log(f_mean[-1] / ts[-1]) / 5.0) * 100
+                drift_pct = (np.log(f_simulated[-1] / ts[-1]) / 5.0) * 100
                 p["eurcop_drift"] = drift_pct
                 p["eurcop_spot"] = ts[-1]
             elif col == "CHFCOP":
-                drift_pct = (np.log(f_mean[-1] / ts[-1]) / 5.0) * 100
+                drift_pct = (np.log(f_simulated[-1] / ts[-1]) / 5.0) * 100
                 p["chfcop_drift"] = drift_pct
                 p["chfcop_spot"] = ts[-1]
             elif col == "UST10Y":
-                # Usamos la tasa proyectada al final como la base USD fija
-                p["usd_fixed_rate"] = f_mean[-1]
+                p["usd_fixed_rate"] = f_simulated[-1]
+
         except Exception as e:
-            print(f"        Error ajustando {col}: {e}")
+            print(f"        Error proyectando {col}: {e}")
 
     plt.tight_layout()
     plot_path = "Forecasts_YahooFinance.png"
@@ -1753,9 +1849,9 @@ def apply_forecasts(p: dict) -> dict:
     plt.close()
 
     # Crear log para PDF
-    log = "\n── PRONÓSTICOS Y MEDICIÓN DE ERRORES (YAHOO FINANCE) ──\n"
+    log = "\n── PRONÓSTICOS Y SELECCIÓN DE MODELO DE MACHINE LEARNING ──\n"
     for m in metrics:
-        log += f"  {m['Variable']:<10} RMSE: {m['RMSE']:>10.4f}   MAE: {m['MAE']:>10.4f}\n"
+        log += f"  {m['Variable']:<10} Modelo: {m['Modelo']:<17} RMSE: {m['RMSE']:>10.4f}   MAE: {m['MAE']:>10.4f}\n"
     log += f"  Drift proyectado USDCOP: {p['usdcop_drift']:.2f}%\n"
     log += f"  Drift proyectado EURCOP: {p['eurcop_drift']:.2f}%\n"
     log += f"  Drift proyectado CHFCOP: {p['chfcop_drift']:.2f}%\n"
